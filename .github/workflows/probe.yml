@@ -108,8 +108,11 @@ jobs:
             almalinux:9 \
             bash -c '
               set -e
+              # HEP_OSlibs pulls -devel packages that live in CRB, which ships
+              # disabled on AlmaLinux, and a few that come from EPEL
+              dnf install -y -q epel-release
               dnf install -y -q https://linuxsoft.cern.ch/wlcg/el9/x86_64/wlcg-repo-1.0.0-1.el9.noarch.rpm
-              dnf install -y -q HEP_OSlibs
+              dnf install -y -q --enablerepo=crb HEP_OSlibs
               source "$LCG_VIEW"
               bash /work/probe.sh lcg
             ' 2>&1 | tee /tmp/lcg.txt || true
