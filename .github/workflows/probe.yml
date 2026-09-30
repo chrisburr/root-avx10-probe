@@ -10,7 +10,7 @@ on:
     inputs:
       samples:
         description: "How many runners to sample"
-        default: "20"
+        default: "40"
       lcg_view:
         description: "LCG view to source"
         default: "/cvmfs/sft.cern.ch/lcg/views/LCG_110a/x86_64-el9-gcc15-opt/setup.sh"
@@ -32,7 +32,7 @@ jobs:
     steps:
       - id: gen
         run: |
-          n="${{ inputs.samples || '20' }}"
+          n="${{ inputs.samples || '40' }}"
           echo "matrix=$(seq 1 "$n" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
 
   probe:
@@ -40,69 +40,81 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         sample: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
 
       - name: Identify the CPU
         id: cpu
         run: |
           model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+          # the kernel does not always advertise avx10 even where the CPU has
+          # it, so record the raw evidence rather than trusting a single flag
           avx10=$(grep -oE 'avx10[^ ]*' /proc/cpuinfo | sort -u | paste -sd, -)
-          pipx install archspec >/dev/null 2>&1 || pip install --quiet archspec || true
-          arch=$(python3 -c 'import archspec.cpu; print(archspec.cpu.host())' 2>/dev/null || echo unknown)
+          avx512=$(grep -m1 -oE 'avx512f' /proc/cpuinfo || true)
+          # archspec from conda-forge, so the label matches the one conda uses
+          # in __archspec - the pip install of this silently failed before
+          arch=$(pixi exec --spec archspec archspec cpu 2>/dev/null || echo unknown)
           {
             echo "model=${model}"
             echo "avx10=${avx10:-none}"
+            echo "avx512=${avx512:-none}"
             echo "arch=${arch}"
           } >> "$GITHUB_OUTPUT"
-          echo "CPU: ${model} | archspec: ${arch} | avx10: ${avx10:-none}"
+          echo "CPU: ${model} | archspec: ${arch} | avx10: ${avx10:-none} | avx512f: ${avx512:-none}"
 
       # --- conda-forge -------------------------------------------------------
-      - uses: prefix-dev/setup-pixi@v0.10.2
-        with:
-          run-install: false
-
       - name: Probe conda-forge root_base
         id: conda
         continue-on-error: true
         run: |
-          pixi exec --spec root_base bash probe.sh conda-forge 2>&1 | tee /tmp/conda.txt
-          grep -q "RESULT conda-forge hit" /tmp/conda.txt && r=hit || r=clean
-          echo "result=$r" >> "$GITHUB_OUTPUT"
+          pixi exec --spec root_base bash probe.sh conda-forge 2>&1 | tee /tmp/conda.txt || true
+          echo "result=$(sed -n 's/^RESULT conda-forge //p' /tmp/conda.txt | tail -1)" >> "$GITHUB_OUTPUT"
 
       # --- LCG view from CVMFS ----------------------------------------------
       - uses: cvmfs-contrib/github-action-cvmfs@v5.6
         with:
           cvmfs_repositories: sft.cern.ch
 
+      - name: Check the view is visible on the host
+        run: |
+          # touching it here triggers the automounter before the bind mount, and
+          # tells us whether a later failure is CVMFS or the container
+          test -e "$LCG_VIEW" && echo "view present on host" || { echo "view MISSING on host"; exit 1; }
+
       # The LCG view is built for EL9 and cannot run on the Ubuntu runner
-      # directly. /cvmfs is mounted on the host by the action above and bind
-      # mounted read-only into an EL9 container.
+      # directly. Bind mounting /cvmfs itself gives "Too many levels of symbolic
+      # links" in the container, because /cvmfs is an autofs mount and the
+      # automounter does not follow into the container's namespace. Mounting the
+      # already-mounted repository directory instead avoids the indirection.
       - name: Probe LCG view
         id: lcg
         continue-on-error: true
         run: |
           docker run --rm \
-            -v /cvmfs:/cvmfs:ro \
+            -v /cvmfs/sft.cern.ch:/cvmfs/sft.cern.ch:ro \
             -v "$PWD:/work:ro" \
             -e LCG_VIEW="$LCG_VIEW" \
             almalinux:9 \
-            bash -c 'source "$LCG_VIEW" && bash /work/probe.sh lcg' 2>&1 | tee /tmp/lcg.txt
-          grep -q "RESULT lcg hit" /tmp/lcg.txt && r=hit || r=clean
-          echo "result=$r" >> "$GITHUB_OUTPUT"
+            bash -c 'source "$LCG_VIEW" && bash /work/probe.sh lcg' 2>&1 | tee /tmp/lcg.txt || true
+          echo "result=$(sed -n 's/^RESULT lcg //p' /tmp/lcg.txt | tail -1)" >> "$GITHUB_OUTPUT"
 
       - name: Record
         if: always()
         run: |
-          printf '| %s | `%s` | %s | %s | **%s** | **%s** |\n' \
+          printf '| %s | `%s` | %s | %s | %s | **%s** | **%s** |\n' \
             "${{ matrix.sample }}" \
             "${{ steps.cpu.outputs.arch }}" \
             "${{ steps.cpu.outputs.model }}" \
             "${{ steps.cpu.outputs.avx10 }}" \
-            "${{ steps.conda.outputs.result || 'error' }}" \
-            "${{ steps.lcg.outputs.result || 'error' }}" \
+            "${{ steps.cpu.outputs.avx512 }}" \
+            "${{ steps.conda.outputs.result || 'did-not-run' }}" \
+            "${{ steps.lcg.outputs.result || 'did-not-run' }}" \
             > row.md
           cat row.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -125,15 +137,18 @@ jobs:
         run: |
           cat rows/*/row.md | sort -t'|' -k2 -n > all.md
           total=$(wc -l < all.md)
-          conda_hits=$(awk -F'|' '$6 ~ /hit/' all.md | wc -l)
-          lcg_hits=$(awk -F'|' '$7 ~ /hit/' all.md | wc -l)
+          count() { awk -F'|' -v c="$1" -v w="$2" '$c ~ w' all.md | wc -l; }
           {
             echo "## AVX10 warning probe"
             echo
-            echo "| # | archspec | CPU | avx10 flags | conda-forge | LCG |"
-            echo "|---|---|---|---|---|---|"
+            echo "| # | archspec | CPU | avx10 | avx512f | conda-forge | LCG |"
+            echo "|---|---|---|---|---|---|---|"
             cat all.md
             echo
-            echo "conda-forge reproduced on **${conda_hits} of ${total}** runners."
-            echo "LCG reproduced on **${lcg_hits} of ${total}** runners."
+            echo "| | hit | clean | did-not-run |"
+            echo "|---|---|---|---|"
+            echo "| conda-forge | $(count 7 hit) | $(count 7 clean) | $(count 7 did-not-run) |"
+            echo "| LCG | $(count 8 hit) | $(count 8 clean) | $(count 8 did-not-run) |"
+            echo
+            echo "Total runners sampled: **${total}**"
           } >> "$GITHUB_STEP_SUMMARY"

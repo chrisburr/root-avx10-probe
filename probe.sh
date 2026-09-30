@@ -12,7 +12,7 @@ label="${1:?usage: probe.sh <label>}"
 err=$(mktemp)
 
 echo "=== ${label} ==="
-echo "root:              $(command -v root)"
+echo "root:              $(command -v root || echo '<not found>')"
 echo "ROOT version:      $(root-config --version 2>/dev/null || echo '?')"
 echo "EXTRA_CLING_ARGS:  ${EXTRA_CLING_ARGS-<unset>}"
 
@@ -25,8 +25,13 @@ echo "--- begin stderr ---"
 cat "$err"
 echo "--- end stderr ---"
 
+# The marker is always printed, so a caller can tell "ran and was clean" from
+# "never got this far" - grepping only for a hit would report a failed probe as
+# clean.
 if grep -q "invalid feature combination" "$err"; then
     echo "RESULT ${label} hit"
+elif [[ $rc -ne 0 ]]; then
+    echo "RESULT ${label} error"
 else
     echo "RESULT ${label} clean"
 fi
