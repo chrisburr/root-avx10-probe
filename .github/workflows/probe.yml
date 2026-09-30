@@ -88,10 +88,15 @@ jobs:
           test -e "$LCG_VIEW" && echo "view present on host" || { echo "view MISSING on host"; exit 1; }
 
       # The LCG view is built for EL9 and cannot run on the Ubuntu runner
-      # directly. Bind mounting /cvmfs itself gives "Too many levels of symbolic
-      # links" in the container, because /cvmfs is an autofs mount and the
-      # automounter does not follow into the container's namespace. Mounting the
-      # already-mounted repository directory instead avoids the indirection.
+      # directly. Two things are needed beyond a bare EL9 image:
+      #
+      #  - Bind mounting /cvmfs itself gives "Too many levels of symbolic links",
+      #    because /cvmfs is an autofs mount and the automounter does not follow
+      #    into the container's namespace. Mount the already-mounted repository
+      #    directory instead.
+      #  - LCG views expect HEP_OSlibs. Without it Cling has no system headers
+      #    and dies on <assert.h> long before it would say anything about the
+      #    CPU, which looks like a clean result but is not one.
       - name: Probe LCG view
         id: lcg
         continue-on-error: true
@@ -101,7 +106,13 @@ jobs:
             -v "$PWD:/work:ro" \
             -e LCG_VIEW="$LCG_VIEW" \
             almalinux:9 \
-            bash -c 'source "$LCG_VIEW" && bash /work/probe.sh lcg' 2>&1 | tee /tmp/lcg.txt || true
+            bash -c '
+              set -e
+              dnf install -y -q https://linuxsoft.cern.ch/wlcg/el9/x86_64/wlcg-repo-1.0.0-1.el9.noarch.rpm
+              dnf install -y -q HEP_OSlibs
+              source "$LCG_VIEW"
+              bash /work/probe.sh lcg
+            ' 2>&1 | tee /tmp/lcg.txt || true
           echo "result=$(sed -n 's/^RESULT lcg //p' /tmp/lcg.txt | tail -1)" >> "$GITHUB_OUTPUT"
 
       - name: Record
@@ -145,10 +156,12 @@ jobs:
             echo "|---|---|---|---|---|---|---|"
             cat all.md
             echo
-            echo "| | hit | clean | did-not-run |"
-            echo "|---|---|---|---|"
-            echo "| conda-forge | $(count 7 hit) | $(count 7 clean) | $(count 7 did-not-run) |"
-            echo "| LCG | $(count 8 hit) | $(count 8 clean) | $(count 8 did-not-run) |"
+            echo "| | hit | clean | other-stderr | error | did-not-run |"
+            echo "|---|---|---|---|---|---|"
+            for col in 7:conda-forge 8:LCG; do
+              c=${col%%:*}; name=${col#*:}
+              echo "| ${name} | $(count "$c" '\*\*hit\*\*') | $(count "$c" '\*\*clean\*\*') | $(count "$c" other-stderr) | $(count "$c" '\*\*error\*\*') | $(count "$c" did-not-run) |"
+            done
             echo
             echo "Total runners sampled: **${total}**"
           } >> "$GITHUB_STEP_SUMMARY"

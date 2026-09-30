@@ -25,13 +25,16 @@ echo "--- begin stderr ---"
 cat "$err"
 echo "--- end stderr ---"
 
-# The marker is always printed, so a caller can tell "ran and was clean" from
-# "never got this far" - grepping only for a hit would report a failed probe as
-# clean.
+# Every outcome gets its own marker. Reporting only hit-vs-clean hides the case
+# that matters most: a probe whose environment is broken produces no warning for
+# reasons that have nothing to do with the CPU, and must not be counted as
+# evidence that the CPU is unaffected.
 if grep -q "invalid feature combination" "$err"; then
     echo "RESULT ${label} hit"
 elif [[ $rc -ne 0 ]]; then
     echo "RESULT ${label} error"
+elif [[ -s "$err" ]]; then
+    echo "RESULT ${label} other-stderr"
 else
     echo "RESULT ${label} clean"
 fi
