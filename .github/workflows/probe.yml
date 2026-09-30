@@ -1,0 +1,139 @@
+name: probe
+
+# GitHub's runner pool is mixed, so the only way to reach the affected CPU is to
+# take many samples and record what each one landed on. Each sample runs the
+# same check twice on the same machine - once against the LCG view from CVMFS,
+# once against conda-forge's root_base - so a hit on one and not the other would
+# point at the build rather than at LLVM.
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: "How many runners to sample"
+        default: "20"
+      lcg_view:
+        description: "LCG view to source"
+        default: "/cvmfs/sft.cern.ch/lcg/views/LCG_110a/x86_64-el9-gcc15-opt/setup.sh"
+  schedule:
+    # the pool changes over time; a weekly sample shows whether it still bites
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  LCG_VIEW: ${{ inputs.lcg_view || '/cvmfs/sft.cern.ch/lcg/views/LCG_110a/x86_64-el9-gcc15-opt/setup.sh' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n="${{ inputs.samples || '20' }}"
+          echo "matrix=$(seq 1 "$n" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Identify the CPU
+        id: cpu
+        run: |
+          model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+          avx10=$(grep -oE 'avx10[^ ]*' /proc/cpuinfo | sort -u | paste -sd, -)
+          pipx install archspec >/dev/null 2>&1 || pip install --quiet archspec || true
+          arch=$(python3 -c 'import archspec.cpu; print(archspec.cpu.host())' 2>/dev/null || echo unknown)
+          {
+            echo "model=${model}"
+            echo "avx10=${avx10:-none}"
+            echo "arch=${arch}"
+          } >> "$GITHUB_OUTPUT"
+          echo "CPU: ${model} | archspec: ${arch} | avx10: ${avx10:-none}"
+
+      # --- conda-forge -------------------------------------------------------
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: Probe conda-forge root_base
+        id: conda
+        continue-on-error: true
+        run: |
+          pixi exec --spec root_base bash probe.sh conda-forge 2>&1 | tee /tmp/conda.txt
+          grep -q "RESULT conda-forge hit" /tmp/conda.txt && r=hit || r=clean
+          echo "result=$r" >> "$GITHUB_OUTPUT"
+
+      # --- LCG view from CVMFS ----------------------------------------------
+      - uses: cvmfs-contrib/github-action-cvmfs@v5.6
+        with:
+          cvmfs_repositories: sft.cern.ch
+
+      # The LCG view is built for EL9 and cannot run on the Ubuntu runner
+      # directly. /cvmfs is mounted on the host by the action above and bind
+      # mounted read-only into an EL9 container.
+      - name: Probe LCG view
+        id: lcg
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v /cvmfs:/cvmfs:ro \
+            -v "$PWD:/work:ro" \
+            -e LCG_VIEW="$LCG_VIEW" \
+            almalinux:9 \
+            bash -c 'source "$LCG_VIEW" && bash /work/probe.sh lcg' 2>&1 | tee /tmp/lcg.txt
+          grep -q "RESULT lcg hit" /tmp/lcg.txt && r=hit || r=clean
+          echo "result=$r" >> "$GITHUB_OUTPUT"
+
+      - name: Record
+        if: always()
+        run: |
+          printf '| %s | `%s` | %s | %s | **%s** | **%s** |\n' \
+            "${{ matrix.sample }}" \
+            "${{ steps.cpu.outputs.arch }}" \
+            "${{ steps.cpu.outputs.model }}" \
+            "${{ steps.cpu.outputs.avx10 }}" \
+            "${{ steps.conda.outputs.result || 'error' }}" \
+            "${{ steps.lcg.outputs.result || 'error' }}" \
+            > row.md
+          cat row.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: row-${{ matrix.sample }}
+          path: row.md
+
+  summary:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: row-*
+          path: rows
+      - name: Table
+        run: |
+          cat rows/*/row.md | sort -t'|' -k2 -n > all.md
+          total=$(wc -l < all.md)
+          conda_hits=$(awk -F'|' '$6 ~ /hit/' all.md | wc -l)
+          lcg_hits=$(awk -F'|' '$7 ~ /hit/' all.md | wc -l)
+          {
+            echo "## AVX10 warning probe"
+            echo
+            echo "| # | archspec | CPU | avx10 flags | conda-forge | LCG |"
+            echo "|---|---|---|---|---|---|"
+            cat all.md
+            echo
+            echo "conda-forge reproduced on **${conda_hits} of ${total}** runners."
+            echo "LCG reproduced on **${lcg_hits} of ${total}** runners."
+          } >> "$GITHUB_STEP_SUMMARY"
